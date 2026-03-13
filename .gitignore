@@ -1,0 +1,13 @@
+# Python Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Sensitive Data (The most important part!)
+.streamlit/secrets.toml
+.env
+
+# User Data
+watchlist_data.json
+portfolio_data.json

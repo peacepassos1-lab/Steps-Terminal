@@ -1,0 +1,714 @@
+import streamlit as st
+import yfinance as yf
+import finnhub
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from fredapi import Fred
+from datetime import datetime, timedelta
+import json
+import os
+import google.generativeai as genai
+
+# --- 1. DATA STORAGE (WATCHLIST & PORTFOLIO) ---
+WATCHLIST_FILE = "watchlist_data.json"
+PORTFOLIO_FILE = "portfolio_data.json"
+
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return ["AAPL", "TSLA", "BTC-USD"]
+    return ["AAPL", "TSLA", "BTC-USD"]
+
+def save_watchlist(watchlist):
+    with open(WATCHLIST_FILE, "w") as f:
+        json.dump(watchlist, f)
+
+def load_portfolio():
+    if os.path.exists(PORTFOLIO_FILE):
+        try:
+            with open(PORTFOLIO_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def save_portfolio(portfolio):
+    with open(PORTFOLIO_FILE, "w") as f:
+        json.dump(portfolio, f)
+
+# --- 2. SETUP & THEME ---
+st.set_page_config(page_title="Market Command Center", layout="wide")
+
+st.markdown("""
+    <style>
+    /* Pitch-Black Terminal with Cyan Accents */
+    .stApp { background-color: #000000; color: #FFFFFF; }
+    
+    /* =========================================
+       PREVENTS SIDEBAR SQUISHING 
+       ========================================= */
+    [data-testid="stSidebar"] { 
+        border-right: 1px solid #333333; 
+        min-width: 330px !important; 
+    }
+    
+    /* =========================================
+       PULLS MAIN PAGE UP TO CEILING
+       ========================================= */
+    .block-container {
+        padding-top: 1.5rem !important; 
+    }
+
+    [data-testid="stMetric"] {
+        background-color: #000000 !important;
+        border: 1px solid #333333 !important;
+        border-left: 3px solid #00d2ff !important;
+        padding: 15px !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stMetricValue"] { color: #FFFFFF !important; font-family: monospace; }
+    
+    .stTabs [data-baseweb="tab-list"] { background-color: #0a0a0a; border-bottom: 1px solid #333333; }
+    .stTabs [data-baseweb="tab"] { color: #888888; }
+    .stTabs [aria-selected="true"] { color: #00d2ff !important; border-bottom: 2px solid #00d2ff !important; }
+
+    a { color: #00d2ff !important; text-decoration: none; font-weight: bold; }
+    a:hover { color: #FFFFFF !important; text-decoration: underline; }
+    
+    [data-testid="stInfo"], [data-testid="stError"], [data-testid="stSuccess"] { 
+        background-color: #000000 !important; 
+        border: 1px solid #333333 !important; 
+        border-left: 3px solid #00d2ff !important; 
+        color: #FFFFFF !important; 
+    }
+    
+    /* Sleek Radio Buttons for Timeframes */
+    div[role="radiogroup"] > label {
+        background-color: #0a0a0a !important;
+        border: 1px solid #333333 !important;
+        border-radius: 5px !important;
+        padding: 5px 15px !important;
+        margin-right: 5px !important;
+    }
+    div[role="radiogroup"] > label[data-checked="true"] {
+        background-color: #00d2ff !important;
+        color: #000000 !important;
+        font-weight: bold;
+    }
+
+    /* Pushes sidebar content up to the top of the screen */
+    [data-testid="stSidebar"] .block-container {
+        padding-top: 1rem !important; 
+        padding-bottom: 1rem !important;
+        gap: 0.5rem !important; 
+    }
+    
+    /* Reduces wasted space around horizontal lines */
+    [data-testid="stSidebar"] hr {
+        margin-top: 0.5rem !important;
+        margin-bottom: 0.5rem !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- 3. API & CACHED DATA ENGINE ---
+fred = Fred(api_key=st.secrets["fred_api_key"])
+finnhub_client = finnhub.Client(api_key=st.secrets["finnhub_api_key"])
+
+try:
+    genai.configure(api_key=st.secrets["gemini_api_key"])
+    ai_model = genai.GenerativeModel('gemini-2.5-flash') 
+except Exception as e:
+    ai_model = None
+
+@st.cache_data(ttl=3600)
+def get_stock_info(symbol):
+    ticker_obj = yf.Ticker(symbol)
+    return {
+        "info": ticker_obj.info,
+        "financials": ticker_obj.financials
+    }
+
+@st.cache_data(ttl=300)
+def get_chart_data(symbol, period):
+    interval = "1m" if period == "1d" else "5m" if period == "5d" else "1d"
+    return yf.Ticker(symbol).history(period=period, interval=interval)
+
+@st.cache_data(ttl=300)
+def get_benchmark_data(period):
+    interval = "1m" if period == "1d" else "5m" if period == "5d" else "1d"
+    return yf.Ticker("SPY").history(period=period, interval=interval)
+
+@st.cache_data(ttl=86400)
+def get_macro_series(series_id):
+    return fred.get_series(series_id).dropna()
+
+@st.cache_data(ttl=3600)
+def get_correlation_data(watchlist_tuple):
+    return yf.download(list(watchlist_tuple), period="6mo", progress=False)['Close']
+
+@st.cache_data(ttl=3600)
+def get_ai_summary(headlines_text):
+    if not ai_model or not headlines_text.strip(): return None
+    
+    prompt = f"""
+    Act as an expert financial analyst. Read the following recent news headlines for an asset. 
+    Write a cohesive, 3-sentence executive briefing summarizing the current narrative. 
+    Highlight any major tailwinds (positives) or headwinds (negatives). 
+    Keep the tone professional and objective.
+    
+    Headlines:
+    {headlines_text}
+    """
+    try:
+        response = ai_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"AI Error: {str(e)}"
+
+@st.fragment(run_every="120s") 
+def render_watchlist():
+    st.markdown("<h4 style='margin-bottom: 5px; margin-top: 10px;'>📈 Watchlist Monitor</h4>", unsafe_allow_html=True)
+    
+    if st.button("🔄 Sync Market Data", use_container_width=True):
+        st.rerun() 
+
+    for stock in st.session_state.watchlist:
+        try:
+            s_ticker = yf.Ticker(stock)
+            s_info = s_ticker.fast_info
+            s_price = s_info['last_price']
+            s_change = ((s_price - s_info['previous_close']) / s_info['previous_close']) * 100
+            
+            color = "#10b981" if s_change >= 0 else "#ef4444" 
+            
+            cols = st.columns([2.5, 2.5, 2, 1.5], vertical_alignment="center")
+            
+            if cols[0].button(f"**{stock}**", key=f"nav_{stock}", use_container_width=True):
+                st.session_state["ticker_search_widget"] = stock
+                st.session_state.active_ticker = stock
+                st.session_state["app_mode_widget"] = "🌍 Market Dashboard"
+                st.rerun()         
+            
+            cols[1].markdown(f"**${s_price:.2f}**")
+            cols[2].markdown(f"<span style='color:{color}; font-weight:bold;'>{s_change:+.1f}%</span>", unsafe_allow_html=True)
+            
+            if cols[3].button("❌", key=f"remove_{stock}", use_container_width=True):
+                st.session_state.watchlist.remove(stock)
+                save_watchlist(st.session_state.watchlist)
+                st.rerun()
+        except Exception as e:
+            st.caption(f"Sync error: {stock}")
+
+def format_large_number(num):
+    if num is None or pd.isna(num): return "N/A"
+    if abs(num) >= 1e12: return f"{num / 1e12:.2f}T"
+    if abs(num) >= 1e9: return f"{num / 1e9:.2f}B"
+    if abs(num) >= 1e6: return f"{num / 1e6:.2f}M"
+    return str(num)
+
+def get_sentiment_score(news_list):
+    bullish = ['surge', 'growth', 'profit', 'buy', 'upbeat', 'expansion', 'dividend']
+    bearish = ['drop', 'lawsuit', 'miss', 'sell', 'risk', 'decline', 'investigation']
+    score = 0
+    for item in news_list:
+        h = item['headline'].lower()
+        score += sum(1 for w in bullish if w in h)
+        score -= sum(1 for w in bearish if w in h)
+    return score
+
+# --- 4. ULTRA-COMPACT SIDEBAR NAVIGATION ---
+st.sidebar.markdown("<h3 style='margin-top: 0px; margin-bottom: 0px;'>📊 STEPS CAPITAL</h3>", unsafe_allow_html=True)
+
+if "app_mode_widget" not in st.session_state:
+    st.session_state["app_mode_widget"] = "🌍 Market Dashboard"
+
+app_mode = st.sidebar.radio(
+    "Navigation", 
+    ["🌍 Market Dashboard", "🏆 Portfolio Backtester"], 
+    key="app_mode_widget",
+    label_visibility="collapsed"
+)
+
+if 'active_ticker' not in st.session_state:
+    st.session_state.active_ticker = "" 
+if 'watchlist' not in st.session_state:
+    st.session_state.watchlist = load_watchlist()
+
+sc1, sc2 = st.sidebar.columns([2, 1], vertical_alignment="center")
+
+ticker_input = sc1.text_input(
+    "Search", 
+    value=st.session_state.active_ticker,
+    placeholder="TICKER...",
+    key="ticker_search_widget",
+    label_visibility="collapsed"
+).upper()
+
+active_ticker = ticker_input
+st.session_state.active_ticker = active_ticker
+
+if sc2.button("➕ Add", use_container_width=True):
+    if active_ticker and active_ticker not in st.session_state.watchlist:
+        st.session_state.watchlist.append(active_ticker)
+        save_watchlist(st.session_state.watchlist)
+        st.rerun()
+
+days_to_look = st.sidebar.slider("News History (Days)", 1, 14, 7)
+    
+with st.sidebar:
+    render_watchlist()
+
+
+# ==========================================
+# 5. APP ROUTING (PORTFOLIO vs DASHBOARD)
+# ==========================================
+
+if app_mode == "🏆 Portfolio Backtester":
+    # --- PORTFOLIO BACKTESTER PAGE ---
+    st.title("🏆 Live Portfolio Tracker")
+    st.markdown("Track exact positions by inputting your real share quantity and average cost basis.")
+    
+    col_in1, col_in2, col_in3, col_in4, col_in5 = st.columns([1.5, 1.5, 1.5, 1.5, 1], vertical_alignment="bottom")
+    with col_in1:
+        p_ticker = st.text_input("Ticker", placeholder="AAPL").upper()
+    with col_in2:
+        p_shares = st.number_input("Shares", min_value=0.01, value=10.0, step=1.0)
+    with col_in3:
+        p_price = st.number_input("Price Paid ($)", min_value=0.01, value=150.0, step=10.0)
+    with col_in4:
+        p_date = st.date_input("Date Bought", value=datetime.now() - timedelta(days=365))
+    with col_in5:
+        if st.button("➕ Add Trade", use_container_width=True):
+            if p_ticker:
+                new_trade = {"ticker": p_ticker, "shares": p_shares, "price": p_price, "date": str(p_date)}
+                current_p = load_portfolio()
+                current_p.append(new_trade)
+                save_portfolio(current_p)
+                st.rerun()
+
+    my_portfolio = load_portfolio()
+    if my_portfolio:
+        combined_value = 0.0
+        initial_investment = 0.0
+        perf_data = []
+        legacy_detected = False
+        
+        with st.spinner("Fetching live prices..."):
+            for trade in my_portfolio:
+                try:
+                    # Catch broken/legacy data immediately
+                    if "shares" not in trade or "price" not in trade:
+                        legacy_detected = True
+                        continue
+
+                    # Fetch the current live price using fast_info
+                    t_obj = yf.Ticker(trade['ticker'])
+                    current_price = t_obj.fast_info['last_price']
+                    
+                    trade_shares = float(trade['shares'])
+                    trade_price = float(trade['price'])
+                    
+                    cost_basis = trade_shares * trade_price
+                    current_val = trade_shares * current_price
+                    profit_loss = current_val - cost_basis
+                    return_pct = (profit_loss / cost_basis) * 100 if cost_basis > 0 else 0
+                    
+                    combined_value += current_val
+                    initial_investment += cost_basis
+                    
+                    perf_data.append({
+                        "Asset": trade['ticker'],
+                        "Date": trade['date'],
+                        "Shares": f"{trade_shares:,.4f}".rstrip('0').rstrip('.'),
+                        "Avg Cost": f"${trade_price:,.2f}",
+                        "Invested": f"${cost_basis:,.2f}",
+                        "Current Val": f"${current_val:,.2f}",
+                        "P/L $": f"{profit_loss:+,.2f}",
+                        "Return %": f"{return_pct:+.2f}%"
+                    })
+                except Exception as e:
+                    st.error(f"Could not fetch data for {trade.get('ticker', 'Unknown')}: {e}")
+
+        # THE FIX: If legacy data trapped the user, spawn an unhideable force reset button
+        if legacy_detected:
+            st.error("🚨 Legacy data format detected. The old format is blocking the portfolio table from rendering.")
+            if st.button("🗑️ Force Reset Portfolio", use_container_width=True):
+                save_portfolio([])
+                st.rerun()
+
+        if perf_data:
+            st.markdown("---")
+            m1, m2, m3 = st.columns(3)
+            total_return_pct = ((combined_value - initial_investment) / initial_investment) * 100 if initial_investment > 0 else 0
+            
+            m1.metric("Total Portfolio Value", f"${combined_value:,.2f}")
+            m2.metric("Total Invested", f"${initial_investment:,.2f}")
+            m3.metric("Combined Return", f"{total_return_pct:+.2f}%")
+
+            st.dataframe(pd.DataFrame(perf_data), use_container_width=True)
+            
+            # --- INDIVIDUAL DELETE LOGIC ---
+            st.markdown("---")
+            st.subheader("⚙️ Manage Positions")
+            
+            man1, man2, man3 = st.columns([2, 1, 1], vertical_alignment="bottom")
+            
+            trade_options = []
+            for i, t in enumerate(my_portfolio):
+                if "shares" in t and "price" in t:
+                    trade_options.append(f"{i} | {t['date']} - {t['ticker']} ({t['shares']} sh @ ${t['price']})")
+
+            with man1:
+                del_selection = st.selectbox("Select Trade to Remove", trade_options, label_visibility="collapsed")
+            with man2:
+                if st.button("❌ Delete Trade", use_container_width=True):
+                    if del_selection:
+                        idx_to_remove = int(del_selection.split(" | ")[0])
+                        my_portfolio.pop(idx_to_remove)
+                        save_portfolio(my_portfolio)
+                        st.rerun()
+            with man3:
+                if st.button("🗑️ Reset All", use_container_width=True):
+                    save_portfolio([])
+                    st.rerun()
+    else:
+        st.info("Your tracker is empty. Input a trade above using your exact shares and cost basis.")
+
+else:
+    # --- MARKET DASHBOARD PAGE ---
+    if active_ticker and active_ticker.strip() != "":
+        # --- INDIVIDUAL STOCK VIEW ---
+        stock_pkg = get_stock_info(active_ticker)
+        info = stock_pkg["info"]
+        
+        fast_hist = yf.Ticker(active_ticker).history(period="5d")
+        if not fast_hist.empty:
+            current_price = fast_hist['Close'].iloc[-1]
+            prev_close = fast_hist['Close'].iloc[-2] if len(fast_hist) > 1 else current_price
+            change = ((current_price - prev_close) / prev_close) * 100
+        else:
+            current_price, change = 0, 0
+
+        st.markdown(f"""
+            <div style="background-color: #000000; padding: 15px; border: 1px solid #333333; border-top: 2px solid #00d2ff; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; font-family: monospace;">
+                <span style="color: white; font-weight: bold; font-size: 20px;">> {info.get('longName', active_ticker).upper()} </span>
+                <span style="color: #00d2ff; font-weight: bold;">SYS_STAT: OK | TCKR: {active_ticker}</span>
+            </div>
+        """, unsafe_allow_html=True)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Price", f"${current_price:,.2f}", f"{change:+.2f}%")
+        k2.metric("Market Cap", format_large_number(info.get('marketCap', 0)))
+        k3.metric("Volume", format_large_number(info.get('regularMarketVolume', 0)))
+        k4.metric("PE Ratio", f"{info.get('trailingPE', 'N/A')}")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        tab_chart, tab_news, tab_fin = st.tabs(["📊 Charting & Tech", "📰 News & Sentiment", "💰 Financials"])
+        
+        with tab_chart:
+            tf_options = {"1D": "1d", "5D": "5d", "1M": "1mo", "3M": "3mo", "6M": "6mo", "YTD": "ytd", "1Y": "1y", "5Y": "5y", "MAX": "max"}
+            selected_tf = st.radio("Timeframe", list(tf_options.keys()), index=6, horizontal=True, label_visibility="collapsed")
+            mapped_period = tf_options[selected_tf]
+
+            hist = get_chart_data(active_ticker, mapped_period)
+            spy_hist = get_benchmark_data(mapped_period)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            chart_type = st.session_state.get('chart_style', 'Line')
+            show_sma = st.session_state.get('toggle_sma', False)
+            show_bb = st.session_state.get('toggle_bb', False)
+            show_rsi = st.session_state.get('toggle_rsi', False)
+            show_macd = st.session_state.get('toggle_macd', False)
+            
+            use_tech = show_sma or show_rsi or show_bb or show_macd or chart_type == "Candle"
+            fig = go.Figure()
+
+            if not use_tech:
+                if not hist.empty and not spy_hist.empty:
+                    ticker_norm = (hist['Close'] / hist['Close'].iloc[0]) * 100
+                    spy_norm = (spy_hist['Close'] / spy_hist['Close'].iloc[0]) * 100
+                    fig.add_trace(go.Scatter(x=ticker_norm.index, y=ticker_norm, name=active_ticker, line=dict(color='#00d2ff', width=3)))
+                    fig.add_trace(go.Scatter(x=spy_norm.index, y=spy_norm, name="S&P 500 (SPY)", line=dict(color='rgba(255,255,255,0.4)', width=2, dash='dot')))
+                y_title = "Normalized Growth (Base 100)"
+            else:
+                if chart_type == "Candle":
+                    fig.add_trace(go.Candlestick(
+                        x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'],
+                        name="Price", increasing_line_color='#10b981', decreasing_line_color='#ef4444'
+                    ))
+                else:
+                    fig.add_trace(go.Scatter(
+                        x=hist.index, y=hist['Close'], name="Price", fill='tozeroy', 
+                        fillcolor='rgba(0, 210, 255, 0.1)', line=dict(color='#00d2ff', width=2.5)
+                    ))
+                
+                if show_sma:
+                    hist['SMA20'] = hist['Close'].rolling(window=20).mean()
+                    hist['SMA50'] = hist['Close'].rolling(window=50).mean()
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['SMA20'], name="20D SMA", line=dict(color='#FFA500', width=1.5)))
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['SMA50'], name="50D SMA", line=dict(color='#10b981', width=1.5)))
+                    
+                if show_bb:
+                    hist['BB_mid'] = hist['Close'].rolling(window=20).mean()
+                    hist['BB_std'] = hist['Close'].rolling(window=20).std()
+                    hist['BB_upper'] = hist['BB_mid'] + 2 * hist['BB_std']
+                    hist['BB_lower'] = hist['BB_mid'] - 2 * hist['BB_std']
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['BB_upper'], name="Upper BB", line=dict(color='rgba(255,255,255,0.3)', dash='dot', width=1)))
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['BB_lower'], name="Lower BB", fill='tonexty', fillcolor='rgba(255,255,255,0.05)', line=dict(color='rgba(255,255,255,0.3)', dash='dot', width=1)))
+
+                y_title = "Price ($)"
+
+            hide_breaks = []
+            if mapped_period in ["1d", "5d"]:
+                hide_breaks = [dict(bounds=["sat", "mon"])] 
+
+            fig.update_layout(
+                height=500, margin=dict(l=0, r=0, t=10, b=0),
+                paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                xaxis_rangeslider_visible=False, yaxis_title=y_title, hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis=dict(rangebreaks=hide_breaks)
+            )
+            fig.update_xaxes(showgrid=False, zeroline=False)
+            fig.update_yaxes(gridcolor='rgba(255,255,255,0.05)', zeroline=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+            t1, t2, t3, t4, t5 = st.columns(5)
+            
+            t1.selectbox("Chart Style", ["Line", "Candle"], key="chart_style", label_visibility="collapsed")
+            t2.toggle("SMA (20/50)", key="toggle_sma")
+            t3.toggle("Bollinger Bands", key="toggle_bb")
+            t4.toggle("RSI Indicator", key="toggle_rsi")
+            t5.toggle("MACD Indicator", key="toggle_macd")
+
+            if show_macd and len(hist) > 26:
+                exp1 = hist['Close'].ewm(span=12, adjust=False).mean()
+                exp2 = hist['Close'].ewm(span=26, adjust=False).mean()
+                macd = exp1 - exp2
+                signal = macd.ewm(span=9, adjust=False).mean()
+                histogram = macd - signal
+                
+                hist_colors = ['#10b981' if val >= 0 else '#ef4444' for val in histogram]
+                
+                fig_macd = go.Figure()
+                fig_macd.add_trace(go.Bar(x=hist.index, y=histogram, name="Hist", marker_color=hist_colors))
+                fig_macd.add_trace(go.Scatter(x=hist.index, y=macd, name="MACD", line=dict(color='#00d2ff', width=1.5)))
+                fig_macd.add_trace(go.Scatter(x=hist.index, y=signal, name="Signal", line=dict(color='#FFA500', width=1.5)))
+                
+                fig_macd.update_layout(height=200, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis_title="MACD", hovermode="x unified", xaxis=dict(rangebreaks=hide_breaks))
+                fig_macd.update_xaxes(showgrid=False)
+                fig_macd.update_yaxes(gridcolor='rgba(255,255,255,0.05)')
+                st.plotly_chart(fig_macd, use_container_width=True)
+
+            if show_rsi and len(hist) > 14:
+                delta = hist['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                hist['RSI'] = 100 - (100 / (1 + rs))
+                
+                fig_rsi = px.line(hist, x=hist.index, y='RSI')
+                fig_rsi.add_hline(y=70, line_dash="dot", line_color="#ef4444", annotation_text="Overbought")
+                fig_rsi.add_hline(y=30, line_dash="dot", line_color="#10b981", annotation_text="Oversold")
+                
+                fig_rsi.update_layout(
+                    height=200, margin=dict(l=0, r=0, t=10, b=0),
+                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                    yaxis_title="RSI (14)", hovermode="x unified", xaxis=dict(rangebreaks=hide_breaks)
+                )
+                fig_rsi.update_xaxes(showgrid=False)
+                fig_rsi.update_yaxes(gridcolor='rgba(255,255,255,0.05)')
+                st.plotly_chart(fig_rsi, use_container_width=True)
+
+        with tab_news:
+            try:
+                start_date = (datetime.now() - timedelta(days=days_to_look)).strftime('%Y-%m-%d')
+                news_items = finnhub_client.company_news(active_ticker, _from=start_date, to=datetime.now().strftime('%Y-%m-%d'))
+            except: news_items = []
+
+            sent = get_sentiment_score(news_items)
+            if sent > 0: st.success(f"**BULLISH SENTIMENT** (Score: {sent})")
+            elif sent < 0: st.error(f"**BEARISH SENTIMENT** (Score: {sent})")
+            else: st.info("**NEUTRAL SENTIMENT**")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            if news_items:
+                headlines_only = "\n".join([f"- {item['headline']}" for item in news_items[:10]])
+                with st.spinner("🤖 AI is synthesizing market data..."):
+                    ai_briefing = get_ai_summary(headlines_only)
+                    
+                if ai_briefing and not ai_briefing.startswith("AI Error"):
+                    st.markdown(f"""
+                        <div style="background-color: #0a0a0a; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 25px;">
+                            <h4 style="color: #00d2ff; margin-top: 0; font-family: monospace;">🤖 AI EXECUTIVE BRIEFING</h4>
+                            <p style="color: #FFFFFF; font-size: 15px; line-height: 1.6;">{ai_briefing}</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+            
+            for item in news_items[:10]:
+                st.markdown(f"""
+                    <div style="background-color: #0a0a0a; padding: 15px; border-radius: 8px; margin-bottom: 10px; border-left: 3px solid #00d2ff;">
+                        <a href="{item['url']}" target="_blank" style="color: #00d2ff; text-decoration: none; font-weight: bold; font-size: 16px;">{item['headline']}</a>
+                        <br>
+                        <span style="color: #888888; font-size: 12px;">{datetime.fromtimestamp(item['datetime']).strftime('%Y-%m-%d %H:%M')} | {item['source']}</span>
+                    </div>
+                """, unsafe_allow_html=True)
+
+        with tab_fin:
+            raw_fin = stock_pkg.get("financials")
+            
+            if raw_fin is not None and not raw_fin.empty:
+                all_metrics = raw_fin.index.tolist()
+
+                categories = {
+                    "Top Line (Growth)": ["Revenue", "Gross Profit", "Sales"],
+                    "Bottom Line (Profit)": ["Net Income", "EBITDA", "Operating Income"],
+                    "Cash & Debt (Risk)": ["Cash", "Debt", "Liability"],
+                    "Efficiency": ["Expense", "Research", "Development", "Assets"]
+                }
+
+                btn_cols = st.columns(len(categories))
+
+                if f'f_sel_{active_ticker}' not in st.session_state:
+                    st.session_state[f'f_sel_{active_ticker}'] = all_metrics[:5]
+
+                for i, (name, keywords) in enumerate(categories.items()):
+                    if btn_cols[i].button(name, key=f"btn_{name}_{active_ticker}", use_container_width=True):
+                        st.session_state[f'f_sel_{active_ticker}'] = [row for row in all_metrics if any(k.lower() in row.lower() for k in keywords)]
+                        st.rerun()
+
+                selected_metrics = st.multiselect(
+                    "Search or refine metrics:", 
+                    options=all_metrics, 
+                    default=st.session_state[f'f_sel_{active_ticker}'],
+                    key=f"ms_{active_ticker}" 
+                )
+
+                display_df = raw_fin.loc[selected_metrics] if selected_metrics else raw_fin.head(5)
+                st.dataframe(display_df.map(format_large_number), use_container_width=True, height=400)
+
+                exp_col1, exp_col2 = st.columns([1, 3])
+                csv = display_df.to_csv().encode('utf-8')
+                exp_col1.download_button("📥 Save CSV", data=csv, file_name=f"{active_ticker}_financials.csv")
+            else:
+                st.info(f"Financial statements are not applicable for {active_ticker} (likely an ETF or Cryptocurrency).")
+
+    else:
+        # --- HOME PAGE VIEW (NO TICKER SEARCHED) ---
+        watchlist_data = []
+        for ticker in st.session_state.watchlist:
+            try:
+                t = yf.Ticker(ticker).fast_info
+                s_price = t['last_price']
+                s_prev_close = t['previous_close']
+                change = ((s_price - s_prev_close) / s_prev_close) * 100
+                
+                color = "#10b981" if change >= 0 else "#ef4444"
+                watchlist_data.append(
+                    f"<span style='color:white; font-weight:bold;'>{ticker}</span> "
+                    f"<span style='color:#00d2ff;'>${s_price:.2f}</span> "
+                    f"<span style='color:{color};'>({change:+.2f}%)</span>"
+                )
+            except: continue
+
+        ticker_html = " &nbsp;&nbsp;&nbsp;&nbsp; | &nbsp;&nbsp;&nbsp;&nbsp; ".join(watchlist_data)
+
+        st.markdown(f"""
+            <style>
+                .ticker-font {{
+                    font-family: monospace;
+                    font-size: 18px;
+                    letter-spacing: 1px;
+                }}
+            </style>
+            <div style="background-color: #000000; padding: 12px; border-top: 1px solid #333333; border-bottom: 1px solid #333333; margin-bottom: 25px;">
+                <marquee behavior="scroll" direction="left" scrollamount="7" class="ticker-font">
+                    {ticker_html}
+                </marquee>
+            </div>
+        """, unsafe_allow_html=True)
+
+        st.subheader("🏛 Market Macro Pulse")
+        m1, m2, m3 = st.columns(3)
+        
+        with m1:
+            st.caption("Fed Funds Rate")
+            st.line_chart(get_macro_series('FEDFUNDS').tail(24), color="#ef4444", height=200)
+        with m2:
+            st.caption("Inflation (CPI)")
+            st.line_chart(get_macro_series('CPIAUCSL').tail(24), color="#10b981", height=200)
+        with m3:
+            st.caption("Yield Curve (10Y-2Y)")
+            try:
+                t10 = get_macro_series('DGS10') 
+                t2 = get_macro_series('DGS2')
+                spread = (t10 - t2).tail(24)
+                st.line_chart(spread, color="#00d2ff", height=200)
+            except Exception as e:
+                st.caption("Yield data unavailable.")
+
+        st.markdown("---")
+
+        col_news, col_corr = st.columns([1, 1.5])
+        
+        with col_news:
+            st.subheader("📰 Global Headlines")
+            try:
+                g_news = finnhub_client.general_news('general', min_id=0)
+                
+                if g_news:
+                    global_headlines = "\n".join([f"- {item['headline']}" for item in g_news[:10]])
+                    
+                    with st.spinner("🤖 AI is synthesizing global macro data..."):
+                        global_briefing = get_ai_summary(global_headlines)
+                        
+                    if global_briefing and not global_briefing.startswith("AI Error"):
+                        st.markdown(f"""
+                            <div style="background-color: #000000; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 25px;">
+                                <h4 style="color: #00d2ff; margin-top: 0; font-family: monospace;">🤖 GLOBAL MACRO BRIEFING</h4>
+                                <p style="color: #FFFFFF; font-size: 15px; line-height: 1.6;">{global_briefing}</p>
+                            </div>
+                        """, unsafe_allow_html=True)
+                
+                with st.container(height=400): 
+                    for item in g_news[:10]:
+                        st.markdown(f"🔗 **[{item['headline']}]({item['url']})**")
+                        st.markdown("---")
+            except: 
+                st.error("News unavailable.")
+
+        with col_corr:
+            st.subheader("🔗 Portfolio Risk: Correlation Matrix")
+            if len(st.session_state.watchlist) > 1:
+                try:
+                    data_all = get_correlation_data(tuple(st.session_state.watchlist))
+                    returns = data_all.ffill().pct_change().dropna()
+                    corr_matrix = returns.corr()
+                    
+                    fig_corr = px.imshow(
+                        corr_matrix, text_auto=".2f", color_continuous_scale='Blues', 
+                        zmin=-1, zmax=1, aspect="auto"
+                    )
+                    
+                    fig_corr.update_layout(
+                        paper_bgcolor='rgba(0,0,0,0)', 
+                        plot_bgcolor='rgba(0,0,0,0)', 
+                        font_color="white", 
+                        height=400,
+                        margin=dict(l=0, r=0, t=30, b=0)
+                    )
+                    st.plotly_chart(fig_corr, use_container_width=True)
+                    
+                except Exception as e:
+                    st.error(f"Matrix calculation failed: {str(e)}")
+            else:
+                st.info("Add more tickers to see risk correlation.")
