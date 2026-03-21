@@ -6,39 +6,52 @@ import plotly.express as px
 import plotly.graph_objects as go
 from fredapi import Fred
 from datetime import datetime, timedelta
-import json
-import os
 import google.generativeai as genai
 
-# --- 1. DATA STORAGE (WATCHLIST & PORTFOLIO) ---
-WATCHLIST_FILE = "watchlist_data.json"
-PORTFOLIO_FILE = "portfolio_data.json"
+# --- 1. DATA STORAGE (SUPABASE CLOUD) ---
+from supabase import create_client, Client
+
+# Initialize Supabase Connection
+@st.cache_resource
+def init_connection():
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception as e:
+        st.error("🚨 Supabase connection failed. Check your API keys in secrets.toml.")
+        return None
+
+supabase = init_connection()
 
 def load_watchlist():
-    if os.path.exists(WATCHLIST_FILE):
+    if supabase:
         try:
-            with open(WATCHLIST_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return ["AAPL", "TSLA", "BTC-USD"]
+            response = supabase.table("watchlist").select("ticker").execute()
+            return [row['ticker'] for row in response.data]
+        except Exception as e:
+            pass
     return ["AAPL", "TSLA", "BTC-USD"]
 
 def save_watchlist(watchlist):
-    with open(WATCHLIST_FILE, "w") as f:
-        json.dump(watchlist, f)
+    if supabase:
+        try:
+            # Clear old watchlist and push the new one
+            supabase.table("watchlist").delete().neq("ticker", "0").execute()
+            if watchlist:
+                data = [{"ticker": t} for t in watchlist]
+                supabase.table("watchlist").insert(data).execute()
+        except Exception as e:
+            st.error(f"Database sync error: {e}")
 
 def load_portfolio():
-    if os.path.exists(PORTFOLIO_FILE):
+    if supabase:
         try:
-            with open(PORTFOLIO_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return []
+            response = supabase.table("portfolio").select("*").order("id").execute()
+            return response.data
+        except Exception as e:
+            pass
     return []
-
-def save_portfolio(portfolio):
-    with open(PORTFOLIO_FILE, "w") as f:
-        json.dump(portfolio, f)
 
 # --- 2. SETUP & THEME ---
 st.set_page_config(page_title="Market Command Center", layout="wide")
@@ -107,8 +120,8 @@ st.markdown("""
         gap: 0.5rem !important; 
     }
     
-    /* Reduces wasted space around horizontal lines */
-    [data-testid="stSidebar"] hr {
+    /* Reduces wasted space around ALL horizontal lines */
+    hr {
         margin-top: 0.5rem !important;
         margin-bottom: 0.5rem !important;
     }
@@ -282,13 +295,12 @@ if app_mode == "🏆 Portfolio Backtester":
         p_price = st.number_input("Price Paid ($)", min_value=0.01, value=150.0, step=10.0)
     with col_in4:
         p_date = st.date_input("Date Bought", value=datetime.now() - timedelta(days=365))
+    
     with col_in5:
         if st.button("➕ Add Trade", use_container_width=True):
-            if p_ticker:
+            if p_ticker and supabase:
                 new_trade = {"ticker": p_ticker, "shares": p_shares, "price": p_price, "date": str(p_date)}
-                current_p = load_portfolio()
-                current_p.append(new_trade)
-                save_portfolio(current_p)
+                supabase.table("portfolio").insert(new_trade).execute()
                 st.rerun()
 
     my_portfolio = load_portfolio()
@@ -301,12 +313,10 @@ if app_mode == "🏆 Portfolio Backtester":
         with st.spinner("Fetching live prices..."):
             for trade in my_portfolio:
                 try:
-                    # Catch broken/legacy data immediately
                     if "shares" not in trade or "price" not in trade:
                         legacy_detected = True
                         continue
 
-                    # Fetch the current live price using fast_info
                     t_obj = yf.Ticker(trade['ticker'])
                     current_price = t_obj.fast_info['last_price']
                     
@@ -334,11 +344,10 @@ if app_mode == "🏆 Portfolio Backtester":
                 except Exception as e:
                     st.error(f"Could not fetch data for {trade.get('ticker', 'Unknown')}: {e}")
 
-        # THE FIX: If legacy data trapped the user, spawn an unhideable force reset button
         if legacy_detected:
             st.error("🚨 Legacy data format detected. The old format is blocking the portfolio table from rendering.")
             if st.button("🗑️ Force Reset Portfolio", use_container_width=True):
-                save_portfolio([])
+                supabase.table("portfolio").delete().neq("id", 0).execute()
                 st.rerun()
 
         if perf_data:
@@ -352,30 +361,64 @@ if app_mode == "🏆 Portfolio Backtester":
 
             st.dataframe(pd.DataFrame(perf_data), use_container_width=True)
             
-            # --- INDIVIDUAL DELETE LOGIC ---
+            # --- SURGICAL INDIVIDUAL DELETE LOGIC ---
             st.markdown("---")
             st.subheader("⚙️ Manage Positions")
             
             man1, man2, man3 = st.columns([2, 1, 1], vertical_alignment="bottom")
             
-            trade_options = []
-            for i, t in enumerate(my_portfolio):
-                if "shares" in t and "price" in t:
-                    trade_options.append(f"{i} | {t['date']} - {t['ticker']} ({t['shares']} sh @ ${t['price']})")
+            # Map valid trades into a dictionary using their database 'id' as the key
+            valid_trades = {t['id']: t for t in my_portfolio if "id" in t}
+
+            def format_dropdown(trade_id):
+                t = valid_trades[trade_id]
+                return f"{t['ticker']} - Bought on {t['date']} ({t['shares']} sh @ ${t['price']})"
 
             with man1:
-                del_selection = st.selectbox("Select Trade to Remove", trade_options, label_visibility="collapsed")
+                del_selection_id = st.selectbox(
+                    "Select Trade to Remove", 
+                    options=list(valid_trades.keys()), 
+                    format_func=format_dropdown, 
+                    label_visibility="collapsed"
+                )
             with man2:
                 if st.button("❌ Delete Trade", use_container_width=True):
-                    if del_selection:
-                        idx_to_remove = int(del_selection.split(" | ")[0])
-                        my_portfolio.pop(idx_to_remove)
-                        save_portfolio(my_portfolio)
+                    if del_selection_id and supabase:
+                        supabase.table("portfolio").delete().eq("id", del_selection_id).execute()
                         st.rerun()
             with man3:
                 if st.button("🗑️ Reset All", use_container_width=True):
-                    save_portfolio([])
+                    if supabase:
+                        supabase.table("portfolio").delete().neq("id", 0).execute()
                     st.rerun()
+            
+            # --- PORTFOLIO CORRELATION MATRIX ---
+            st.markdown("---")
+            st.subheader("🔗 Portfolio Risk: Correlation Matrix")
+            
+            owned_tickers = list(set([trade['ticker'] for trade in my_portfolio if 'ticker' in trade]))
+            
+            if len(owned_tickers) > 1:
+                try:
+                    with st.spinner("Calculating risk correlation..."):
+                        data_all = get_correlation_data(tuple(owned_tickers))
+                        returns = data_all.ffill().pct_change().dropna()
+                        corr_matrix = returns.corr()
+                        
+                        fig_corr = px.imshow(
+                            corr_matrix, text_auto=".2f", color_continuous_scale='Blues', 
+                            zmin=-1, zmax=1, aspect="auto"
+                        )
+                        
+                        fig_corr.update_layout(
+                            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+                            font_color="white", height=400, margin=dict(l=0, r=0, t=30, b=0)
+                        )
+                        st.plotly_chart(fig_corr, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Matrix calculation failed: {str(e)}")
+            else:
+                st.info("Add at least 2 different tickers to your portfolio to analyze risk correlation.")
     else:
         st.info("Your tracker is empty. Input a trade above using your exact shares and cost basis.")
 
@@ -624,17 +667,32 @@ else:
 
         st.markdown(f"""
             <style>
-                .ticker-font {{
+                @keyframes scroll-left {{
+                    0% {{ transform: translateX(100%); }}
+                    100% {{ transform: translateX(-100%); }}
+                }}
+                .ticker-container {{
+                    background-color: #000000;
+                    padding: 12px 0;
+                    border-top: 1px solid #333333;
+                    border-bottom: 1px solid #333333;
+                    margin-bottom: 10px;
+                    overflow: hidden;
+                    white-space: nowrap;
+                    width: 100%;
+                }}
+                .ticker-text {{
+                    display: inline-block;
                     font-family: monospace;
                     font-size: 18px;
                     letter-spacing: 1px;
+                    animation: scroll-left 25s linear infinite;
+                }}
+                .ticker-text:hover {{
+                    animation-play-state: paused;
                 }}
             </style>
-            <div style="background-color: #000000; padding: 12px; border-top: 1px solid #333333; border-bottom: 1px solid #333333; margin-bottom: 25px;">
-                <marquee behavior="scroll" direction="left" scrollamount="7" class="ticker-font">
-                    {ticker_html}
-                </marquee>
-            </div>
+            <div class="ticker-container"><div class="ticker-text">{ticker_html}</div></div>
         """, unsafe_allow_html=True)
 
         st.subheader("🏛 Market Macro Pulse")
@@ -642,23 +700,23 @@ else:
         
         with m1:
             st.caption("Fed Funds Rate")
-            st.line_chart(get_macro_series('FEDFUNDS').tail(24), color="#ef4444", height=200)
+            st.line_chart(get_macro_series('FEDFUNDS').tail(24), color="#ef4444", height=150)
         with m2:
             st.caption("Inflation (CPI)")
-            st.line_chart(get_macro_series('CPIAUCSL').tail(24), color="#10b981", height=200)
+            st.line_chart(get_macro_series('CPIAUCSL').tail(24), color="#10b981", height=150)
         with m3:
             st.caption("Yield Curve (10Y-2Y)")
             try:
                 t10 = get_macro_series('DGS10') 
                 t2 = get_macro_series('DGS2')
                 spread = (t10 - t2).tail(24)
-                st.line_chart(spread, color="#00d2ff", height=200)
+                st.line_chart(spread, color="#00d2ff", height=150)
             except Exception as e:
                 st.caption("Yield data unavailable.")
 
         st.markdown("---")
 
-        col_news, col_corr = st.columns([1, 1.5])
+        col_news, col_heat = st.columns([1, 1.5])
         
         with col_news:
             st.subheader("📰 Global Headlines")
@@ -673,7 +731,7 @@ else:
                         
                     if global_briefing and not global_briefing.startswith("AI Error"):
                         st.markdown(f"""
-                            <div style="background-color: #000000; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 25px;">
+                            <div style="background-color: #000000; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 10px;">
                                 <h4 style="color: #00d2ff; margin-top: 0; font-family: monospace;">🤖 GLOBAL MACRO BRIEFING</h4>
                                 <p style="color: #FFFFFF; font-size: 15px; line-height: 1.6;">{global_briefing}</p>
                             </div>
@@ -686,29 +744,72 @@ else:
             except: 
                 st.error("News unavailable.")
 
-        with col_corr:
-            st.subheader("🔗 Portfolio Risk: Correlation Matrix")
-            if len(st.session_state.watchlist) > 1:
-                try:
-                    data_all = get_correlation_data(tuple(st.session_state.watchlist))
-                    returns = data_all.ffill().pct_change().dropna()
-                    corr_matrix = returns.corr()
+        with col_heat:
+            h_col1, h_col2 = st.columns([1.5, 1], vertical_alignment="center")
+            
+            with h_col1:
+                st.subheader("🗺️ Market Heat Map")
+            
+            indices = {
+                "S&P 500 (Top 30)": ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'META', 'GOOGL', 'GOOG', 'BRK-B', 'LLY', 'AVGO', 'JPM', 'TSLA', 'UNH', 'V', 'XOM', 'MA', 'JNJ', 'PG', 'HD', 'COST', 'MRK', 'ABBV', 'CRM', 'CVX', 'AMD', 'BAC', 'PEP', 'LIN', 'KO', 'TMO'],
+                "NASDAQ 100 (Top 30)": ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'META', 'GOOGL', 'GOOG', 'AVGO', 'TSLA', 'COST', 'PEP', 'CSCO', 'TMUS', 'ADBE', 'TXN', 'QCOM', 'AMD', 'CMCSA', 'INTU', 'AMGN', 'HON', 'AMAT', 'ISRG', 'SBUX', 'BKNG', 'GILD', 'PANW', 'VRTX', 'MDLZ', 'REGN'],
+                "Dow Jones (30)": ['AAPL', 'AMGN', 'AXP', 'BA', 'CAT', 'CRM', 'CSCO', 'CVX', 'DIS', 'DOW', 'GS', 'HD', 'HON', 'IBM', 'INTC', 'JNJ', 'JPM', 'KO', 'MCD', 'MMM', 'MRK', 'MSFT', 'NKE', 'PG', 'TRV', 'UNH', 'V', 'VZ', 'WBA', 'WMT']
+            }
+            
+            with h_col2:
+                selected_index = st.selectbox("Select Market", list(indices.keys()), label_visibility="collapsed")
+                
+            target_tickers = indices[selected_index]
+            
+            heatmap_data = []
+            with st.spinner(f"Rendering {selected_index} map..."):
+                for stock in target_tickers:
+                    try:
+                        info = yf.Ticker(stock).fast_info
+                        price = info['last_price']
+                        prev = info['previous_close']
+                        change = ((price - prev) / prev) * 100
+                        
+                        try:
+                            mcap = info['market_cap']
+                        except:
+                            mcap = 1000000000 
+                            
+                        change_str = f"{change:+.1f}%"
+                            
+                        heatmap_data.append({
+                            "Ticker": stock, 
+                            "Change": change,          
+                            "Change_Str": change_str,   
+                            "Market Cap": mcap
+                        })
+                    except:
+                        continue
+                
+                if heatmap_data:
+                    df_heat = pd.DataFrame(heatmap_data)
                     
-                    fig_corr = px.imshow(
-                        corr_matrix, text_auto=".2f", color_continuous_scale='Blues', 
-                        zmin=-1, zmax=1, aspect="auto"
+                    fig_tree = px.treemap(
+                        df_heat,
+                        path=[px.Constant(selected_index), 'Ticker'],
+                        values='Market Cap',
+                        color='Change',
+                        color_continuous_scale=['#ef4444', '#000000', '#10b981'], 
+                        color_continuous_midpoint=0,
+                        custom_data=['Change_Str'] 
                     )
                     
-                    fig_corr.update_layout(
-                        paper_bgcolor='rgba(0,0,0,0)', 
-                        plot_bgcolor='rgba(0,0,0,0)', 
-                        font_color="white", 
-                        height=400,
-                        margin=dict(l=0, r=0, t=30, b=0)
+                    fig_tree.update_traces(
+                        textinfo="label+text",
+                        texttemplate="<b>%{label}</b><br>%{customdata[0]}",
+                        textfont=dict(color="white", size=26), 
+                        hovertemplate="<b>%{label}</b><br>Daily Change: %{customdata[0]}<br>Market Cap: $%{value:,.0f}<extra></extra>"
                     )
-                    st.plotly_chart(fig_corr, use_container_width=True)
                     
-                except Exception as e:
-                    st.error(f"Matrix calculation failed: {str(e)}")
-            else:
-                st.info("Add more tickers to see risk correlation.")
+                    fig_tree.update_layout(
+                        margin=dict(t=10, l=0, r=0, b=0),
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        height=400
+                    )
+                    
+                    st.plotly_chart(fig_tree, use_container_width=True)
