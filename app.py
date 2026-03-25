@@ -326,19 +326,52 @@ def get_heatmap_data(index_name, tickers_tuple):
             continue
     return heatmap_data
 
+@st.cache_data(ttl=30)
+def get_watchlist_prices(watchlist_tuple):
+    """Fetches all watchlist prices in one yf.download call instead of N sequential requests."""
+    if not watchlist_tuple:
+        return {}
+    try:
+        raw = yf.download(list(watchlist_tuple), period="2d", progress=False, auto_adjust=True)
+        prices = {}
+        close = raw['Close']
+        if isinstance(close, pd.Series):
+            close = close.to_frame(name=watchlist_tuple[0])
+        for ticker in watchlist_tuple:
+            if ticker in close.columns:
+                series = close[ticker].dropna()
+                if len(series) >= 2:
+                    prices[ticker] = {
+                        "last_price": float(series.iloc[-1]),
+                        "previous_close": float(series.iloc[-2])
+                    }
+                elif len(series) == 1:
+                    prices[ticker] = {
+                        "last_price": float(series.iloc[-1]),
+                        "previous_close": float(series.iloc[-1])
+                    }
+        return prices
+    except Exception:
+        return {}
+
 @st.fragment(run_every="120s") 
 def render_watchlist():
     st.markdown("<h4 style='margin-bottom: 5px; margin-top: 10px;'>📈 Watchlist Monitor</h4>", unsafe_allow_html=True)
     
     if st.button("🔄 Sync Market Data", use_container_width=True):
-        st.rerun() 
+        st.cache_data.clear()
+        st.rerun()
+
+    prices = get_watchlist_prices(tuple(st.session_state.watchlist))
 
     for stock in st.session_state.watchlist:
         try:
-            s_ticker = yf.Ticker(stock)
-            s_info = s_ticker.fast_info
-            s_price = s_info['last_price']
-            s_change = ((s_price - s_info['previous_close']) / s_info['previous_close']) * 100
+            data = prices.get(stock)
+            if not data:
+                st.caption(f"⚠️ {stock}: no data")
+                continue
+            s_price = data["last_price"]
+            s_change = ((s_price - data["previous_close"]) / data["previous_close"]) * 100
             
             color = "#10b981" if s_change >= 0 else "#ef4444" 
             
@@ -357,7 +390,7 @@ def render_watchlist():
                 save_watchlist(st.session_state.watchlist)
                 st.rerun()
         except Exception as e:
-            st.caption(f"Sync error: {stock}")
+            st.caption(f"⚠️ {stock}: {e}")
 
 def format_large_number(num):
     if num is None or pd.isna(num): return "N/A"
@@ -984,21 +1017,25 @@ else:
 
     else:
         # --- HOME PAGE VIEW (NO TICKER SEARCHED) ---
+        # Reuse the same cached batch fetch as the sidebar — zero extra API calls
+        ticker_prices = get_watchlist_prices(tuple(st.session_state.watchlist))
         watchlist_data = []
         for ticker in st.session_state.watchlist:
             try:
-                t = yf.Ticker(ticker).fast_info
-                s_price = t['last_price']
-                s_prev_close = t['previous_close']
+                data = ticker_prices.get(ticker)
+                if not data:
+                    continue
+                s_price = data["last_price"]
+                s_prev_close = data["previous_close"]
                 change = ((s_price - s_prev_close) / s_prev_close) * 100
-                
                 color = "#10b981" if change >= 0 else "#ef4444"
                 watchlist_data.append(
                     f"<span style='color:white; font-weight:bold;'>{ticker}</span> "
                     f"<span style='color:#00d2ff;'>${s_price:.2f}</span> "
                     f"<span style='color:{color};'>({change:+.2f}%)</span>"
                 )
-            except: continue
+            except Exception as e:
+                continue
 
         ticker_html = " &nbsp;&nbsp;&nbsp;&nbsp; | &nbsp;&nbsp;&nbsp;&nbsp; ".join(watchlist_data)
 
@@ -1059,27 +1096,32 @@ else:
             st.subheader("📰 Global Headlines")
             try:
                 g_news = finnhub_client.general_news('general', min_id=0)
-                
+
                 if g_news:
+                    # Render headlines immediately — no waiting
+                    with st.container(height=400):
+                        for item in g_news[:10]:
+                            st.markdown(f"🔗 **[{item['headline']}]({item['url']})**")
+                            st.markdown("---")
+
+                    # AI briefing loads async after headlines are visible
+                    @st.fragment
+                    def render_global_briefing(headlines):
+                        with st.spinner("🤖 AI is synthesizing global macro data..."):
+                            global_briefing = get_ai_summary(headlines)
+                        if global_briefing and not global_briefing.startswith("AI Error"):
+                            st.markdown(f"""
+                                <div style="background-color: #000000; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 10px;">
+                                    <h4 style="color: #00d2ff; margin-top: 0; font-family: monospace;">🤖 GLOBAL MACRO BRIEFING</h4>
+                                    <p style="color: #FFFFFF; font-size: 15px; line-height: 1.6;">{global_briefing}</p>
+                                </div>
+                            """, unsafe_allow_html=True)
+
                     global_headlines = "\n".join([f"- {item['headline']}" for item in g_news[:10]])
-                    
-                    with st.spinner("🤖 AI is synthesizing global macro data..."):
-                        global_briefing = get_ai_summary(global_headlines)
-                        
-                    if global_briefing and not global_briefing.startswith("AI Error"):
-                        st.markdown(f"""
-                            <div style="background-color: #000000; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 10px;">
-                                <h4 style="color: #00d2ff; margin-top: 0; font-family: monospace;">🤖 GLOBAL MACRO BRIEFING</h4>
-                                <p style="color: #FFFFFF; font-size: 15px; line-height: 1.6;">{global_briefing}</p>
-                            </div>
-                        """, unsafe_allow_html=True)
-                
-                with st.container(height=400): 
-                    for item in g_news[:10]:
-                        st.markdown(f"🔗 **[{item['headline']}]({item['url']})**")
-                        st.markdown("---")
-            except: 
-                st.error("News unavailable.")
+                    render_global_briefing(global_headlines)
+
+            except Exception as e:
+                st.error(f"News unavailable: {e}")
 
         with col_heat:
             h_col1, h_col2 = st.columns([1.5, 1], vertical_alignment="center")
