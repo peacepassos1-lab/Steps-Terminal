@@ -12,5 +12,5 @@ myenv/
 .env
 
 # User Data
-watchlist_data.json
+watchlist_*.json
 portfolio_data.json
