@@ -134,6 +134,18 @@ st.markdown("""
         margin-top: 0.5rem !important;
         margin-bottom: 0.5rem !important;
     }
+
+    /* Cyan border around the ticker search input box */
+    [data-testid="stSidebar"] [data-testid="stTextInput"] input {
+        border: 1px solid #00d2ff !important;
+        border-radius: 4px !important;
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stTextInput"] input:focus {
+        border: 1px solid #00d2ff !important;
+        box-shadow: 0 0 6px rgba(0, 210, 255, 0.3) !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -982,11 +994,8 @@ else:
                 .ticker-container {{
                     background-color: #000000;
                     padding: 12px 0;
-                    border-top: 1px solid #00d2ff;
-                    border-bottom: 1px solid #00d2ff;
-                    border-left: 1px solid #00d2ff;
-                    border-right: 1px solid #00d2ff;
-                    border-radius: 6px;
+                    border-top: 1px solid #333333;
+                    border-bottom: 1px solid #333333;
                     margin-bottom: 10px;
                     overflow: hidden;
                     white-space: nowrap;
