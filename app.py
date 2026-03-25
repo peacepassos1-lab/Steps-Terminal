@@ -982,8 +982,11 @@ else:
                 .ticker-container {{
                     background-color: #000000;
                     padding: 12px 0;
-                    border-top: 1px solid #333333;
-                    border-bottom: 1px solid #333333;
+                    border-top: 1px solid #00d2ff;
+                    border-bottom: 1px solid #00d2ff;
+                    border-left: 1px solid #00d2ff;
+                    border-right: 1px solid #00d2ff;
+                    border-radius: 6px;
                     margin-bottom: 10px;
                     overflow: hidden;
                     white-space: nowrap;

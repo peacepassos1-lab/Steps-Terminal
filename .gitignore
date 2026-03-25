@@ -5,7 +5,6 @@ __pycache__/
 *.pyc
 
 # Sensitive Data (The most important part!)
-.streamlit/
 myenv/
 
 .streamlit/secrets.toml
