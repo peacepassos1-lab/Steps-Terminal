@@ -1,6 +1,6 @@
 [theme]
 # The primary accent color for interactive elements (keeping your teal)
-primaryColor = "#00d4b2"
+primaryColor = "#FFFFFF"
 
 # The main background color for the main body of the app (Bloomberg Black)
 backgroundColor = "#000000"

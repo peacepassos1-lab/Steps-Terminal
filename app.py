@@ -69,6 +69,11 @@ st.markdown("""
     <style>
     /* Pitch-Black Terminal with Cyan Accents */
     .stApp { background-color: #000000; color: #FFFFFF; }
+
+    /* Kill Streamlit's teal primary color on inputs */
+    :root {
+        --primary-color: #FFFFFF !important;
+    }
     
     /* =========================================
        PREVENTS SIDEBAR SQUISHING 
@@ -135,16 +140,28 @@ st.markdown("""
         margin-bottom: 0.5rem !important;
     }
 
-    /* Cyan border around the ticker search input box */
-    [data-testid="stSidebar"] [data-testid="stTextInput"] input {
-        border: 1px solid #00d2ff !important;
-        border-radius: 4px !important;
+    /* White sharp border around the ticker search input box */
+    [data-testid="stSidebar"] [data-testid="stTextInput"] > div > div > input {
+        border: 1px solid #FFFFFF !important;
+        border-radius: 0px !important;
+        outline: none !important;
+        box-shadow: none !important;
         background-color: #000000 !important;
         color: #FFFFFF !important;
     }
-    [data-testid="stSidebar"] [data-testid="stTextInput"] input:focus {
-        border: 1px solid #00d2ff !important;
-        box-shadow: 0 0 6px rgba(0, 210, 255, 0.3) !important;
+    [data-testid="stSidebar"] [data-testid="stTextInput"] > div > div {
+        border: 1px solid #FFFFFF !important;
+        border-radius: 0px !important;
+        box-shadow: none !important;
+        background-color: #000000 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stTextInput"] > div > div:focus-within {
+        border: 1px solid #FFFFFF !important;
+        border-radius: 0px !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stTextInput"] * {
+        border-radius: 0px !important;
     }
     </style>
     """, unsafe_allow_html=True)
