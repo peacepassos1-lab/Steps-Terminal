@@ -1,14 +1,14 @@
 [theme]
-# The primary accent color for interactive elements
+# The primary accent color for interactive elements (keeping your teal)
 primaryColor = "#00d4b2"
 
-# The main background color for the main body of the app
-backgroundColor = "#0E1117"
+# The main background color for the main body of the app (Bloomberg Black)
+backgroundColor = "#000000"
 
-# The background color for the sidebar and top bar
-secondaryBackgroundColor = "#161b22"
+# The background color for the sidebar and top bar (Matching Black)
+secondaryBackgroundColor = "#000000"
 
-# The text color
+# The text color (Crisp White for maximum contrast)
 textColor = "#FAFAFA"
 
 # Font family
