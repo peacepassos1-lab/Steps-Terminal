@@ -4,5 +4,5 @@ finnhub-python
 pandas
 plotly
 fredapi
-google-generativeai
+google-genai
 supabase

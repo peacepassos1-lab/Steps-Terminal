@@ -6,7 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from fredapi import Fred
 from datetime import datetime, timedelta
-import google.generativeai as genai
+import google.genai as genai
 
 # --- 1. DATA STORAGE (SUPABASE CLOUD) ---
 from supabase import create_client, Client
@@ -170,19 +170,51 @@ st.markdown("""
 fred = Fred(api_key=st.secrets["fred_api_key"])
 finnhub_client = finnhub.Client(api_key=st.secrets["finnhub_api_key"])
 
-try:
-    genai.configure(api_key=st.secrets["gemini_api_key"])
-    ai_model = genai.GenerativeModel('gemini-2.5-flash') 
-except Exception as e:
-    ai_model = None
+# Ordered fallback list — if Google retires the first, the next is tried automatically
+GEMINI_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+]
 
-@st.cache_data(ttl=3600)
+try:
+    ai_client = genai.Client(api_key=st.secrets["gemini_api_key"])
+except KeyError:
+    st.warning("⚠️ Gemini API key not found in secrets.toml — AI features disabled.")
+    ai_client = None
+except Exception as e:
+    st.warning(f"⚠️ Gemini initialization failed: {e} — AI features disabled.")
+    ai_client = None
+
+def call_gemini(prompt):
+    """Tries each model in GEMINI_MODELS until one works. Returns (text, model_used) or (None, None)."""
+    if not ai_client:
+        return None, None
+    for model in GEMINI_MODELS:
+        try:
+            response = ai_client.models.generate_content(model=model, contents=prompt)
+            raw = response.text
+            if raw and raw.strip():
+                return raw.strip(), model
+        except Exception as e:
+            err = str(e)
+            if "404" in err or "429" in err or "not found" in err.lower():
+                continue
+            return None, None
+    return None, None
+
+@st.cache_data(ttl=14400)  # 4 hours — reduces Yahoo Finance hits on shared hosting IPs
 def get_stock_info(symbol):
     ticker_obj = yf.Ticker(symbol)
-    return {
-        "info": ticker_obj.info,
-        "financials": ticker_obj.financials
-    }
+    try:
+        info = ticker_obj.info
+    except Exception:
+        info = {}
+    try:
+        financials = ticker_obj.financials
+    except Exception:
+        financials = None
+    return {"info": info, "financials": financials}
 
 @st.cache_data(ttl=300)
 def get_chart_data(symbol, period):
@@ -204,50 +236,88 @@ def get_correlation_data(watchlist_tuple):
 
 @st.cache_data(ttl=3600)
 def get_ai_news_analysis(headlines_text):
-    """Returns (briefing_text, sentiment_label, sentiment_reasoning) in one Gemini call.
-    Falls back gracefully if AI is unavailable."""
-    if not ai_model or not headlines_text.strip():
+    """Returns (briefing_text, sentiment_label, sentiment_reasoning) in one Gemini call."""
+    if not ai_client or not headlines_text.strip():
         return None, None, None
     prompt = f"""
     Act as an expert financial analyst. Read the following recent news headlines.
 
     Your response must follow this EXACT format with these three labeled sections:
 
-    BRIEFING: [Write a cohesive 3-sentence executive summary highlighting key tailwinds and headwinds. Professional and objective tone.]
+    BRIEFING: Write a cohesive 3-sentence executive summary highlighting key tailwinds and headwinds. Professional and objective tone.
 
-    SENTIMENT: [Write exactly one word: BULLISH, BEARISH, or NEUTRAL]
+    SENTIMENT: Write exactly one word: BULLISH, BEARISH, or NEUTRAL
 
-    REASONING: [Write one concise sentence explaining the sentiment label.]
+    REASONING: Write one concise sentence explaining the sentiment label.
 
     Headlines:
     {headlines_text}
     """
     try:
-        response = ai_model.generate_content(prompt)
-        text = response.text
+        raw, _ = call_gemini(prompt)
+        if not raw:
+            return None, None, None
+
+        import re
+        text = raw.replace('\r\n', '\n').replace('\r', '\n')
+        text = re.sub(r'\*\*\s*([A-Z]+)\s*\*\*\s*:', r'\1:', text)
+        text = re.sub(r'\*\*\s*([A-Z]+:)\s*\*\*', r'\1', text)
+        text = re.sub(r':\s*\[([^\]]+)\]', r': \1', text)
 
         briefing, sentiment, reasoning = None, None, None
 
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("BRIEFING:"):
-                briefing = line.replace("BRIEFING:", "").strip()
-            elif line.startswith("SENTIMENT:"):
-                raw = line.replace("SENTIMENT:", "").strip().upper()
-                if "BULLISH" in raw:
-                    sentiment = "BULLISH"
-                elif "BEARISH" in raw:
-                    sentiment = "BEARISH"
-                else:
-                    sentiment = "NEUTRAL"
-            elif line.startswith("REASONING:"):
-                reasoning = line.replace("REASONING:", "").strip()
+        b_match = re.search(r'BRIEFING:\s*(.*?)(?=\n\s*SENTIMENT:|\Z)', text, re.DOTALL | re.IGNORECASE)
+        if b_match:
+            briefing = b_match.group(1).strip()
+
+        s_match = re.search(r'SENTIMENT:\s*\[?\s*(BULLISH|BEARISH|NEUTRAL)\s*\]?', text, re.IGNORECASE)
+        if s_match:
+            sentiment = s_match.group(1).upper()
+
+        r_match = re.search(r'REASONING:\s*(.*?)(?=\n\s*[A-Z]+:|\Z)', text, re.DOTALL | re.IGNORECASE)
+        if r_match:
+            reasoning = r_match.group(1).strip()
 
         return briefing, sentiment, reasoning
-    except Exception as e:
+    except Exception:
         return None, None, None
 
-# Thin wrapper for the global headlines section (no separate cache needed)
+def get_global_briefing(headlines_text):
+    """Uses session-state TTL cache and call_gemini fallback chain."""
+    import time
+
+    cache_key = "global_briefing_result"
+    cache_ts_key = "global_briefing_ts"
+    ttl_seconds = 3600
+
+    now = time.time()
+    cached_result = st.session_state.get(cache_key)
+    cached_ts = st.session_state.get(cache_ts_key, 0)
+    cached_headlines = st.session_state.get("global_briefing_headlines", "")
+
+    if (cached_result
+            and (now - cached_ts) < ttl_seconds
+            and cached_headlines == headlines_text):
+        return cached_result
+
+    if not ai_client or not headlines_text.strip():
+        return None
+
+    prompt = f"""You are an expert financial analyst. Read these news headlines and write a clear, 
+3-sentence executive briefing summarizing the dominant macro narrative, key risks, and any bright spots.
+Write in plain prose. Do not use bullet points or labels.
+
+Headlines:
+{headlines_text}"""
+
+    result, _ = call_gemini(prompt)
+    if result:
+        st.session_state[cache_key] = result
+        st.session_state[cache_ts_key] = now
+        st.session_state["global_briefing_headlines"] = headlines_text
+    return result
+
+# Thin wrapper for ticker news tab (no separate cache needed)
 def get_ai_summary(headlines_text):
     briefing, _, _ = get_ai_news_analysis(headlines_text)
     return briefing
@@ -360,6 +430,8 @@ def render_watchlist():
     
     if st.button("🔄 Sync Market Data", use_container_width=True):
         st.cache_data.clear()
+        for k in ["global_briefing_result", "global_briefing_ts", "global_briefing_headlines"]:
+            st.session_state.pop(k, None)
         st.rerun()
 
     prices = get_watchlist_prices(tuple(st.session_state.watchlist))
@@ -770,8 +842,18 @@ else:
     # --- MARKET DASHBOARD PAGE ---
     if active_ticker and active_ticker.strip() != "":
         # --- INDIVIDUAL STOCK VIEW ---
-        stock_pkg = get_stock_info(active_ticker)
+        try:
+            stock_pkg = get_stock_info(active_ticker)
+        except Exception as e:
+            st.error(f"⚠️ Could not load data for **{active_ticker}** — Yahoo Finance may be rate limiting. Please wait a moment and try again.")
+            st.caption(f"Technical detail: {e}")
+            st.stop()
+
         info = stock_pkg["info"]
+
+        if not info:
+            st.warning(f"⚠️ No data returned for **{active_ticker}**. This may be a temporary rate limit from Yahoo Finance. Try again in a moment.")
+            st.stop()
         
         fast_hist = yf.Ticker(active_ticker).history(period="5d")
         if not fast_hist.empty:
@@ -932,8 +1014,8 @@ else:
                 with st.spinner("🤖 AI is analyzing sentiment..."):
                     ai_briefing, ai_sentiment, ai_reasoning = get_ai_news_analysis(headlines_only)
 
+            # Sentiment badge — renders independently of briefing
             if ai_sentiment:
-                # AI sentiment badge
                 badge_color = "#10b981" if ai_sentiment == "BULLISH" else "#ef4444" if ai_sentiment == "BEARISH" else "#888888"
                 badge_icon = "📈" if ai_sentiment == "BULLISH" else "📉" if ai_sentiment == "BEARISH" else "➡️"
                 st.markdown(f"""
@@ -951,7 +1033,7 @@ else:
                     </div>
                 """, unsafe_allow_html=True)
             else:
-                # Keyword fallback
+                # Keyword fallback — only shown if AI sentiment parsing failed
                 sent = get_sentiment_score(news_items)
                 if sent > 0: st.success(f"**BULLISH SENTIMENT** (Score: {sent})")
                 elif sent < 0: st.error(f"**BEARISH SENTIMENT** (Score: {sent})")
@@ -959,6 +1041,7 @@ else:
 
             st.markdown("<br>", unsafe_allow_html=True)
 
+            # Briefing renders independently — not gated on ai_sentiment being truthy
             if ai_briefing:
                 st.markdown(f"""
                     <div style="background-color: #0a0a0a; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 25px;">
@@ -1098,27 +1181,23 @@ else:
                 g_news = finnhub_client.general_news('general', min_id=0)
 
                 if g_news:
-                    # Render headlines immediately — no waiting
+                    global_headlines = "\n".join([f"- {item['headline']}" for item in g_news[:10]])
+
+                    with st.spinner("🤖 AI is synthesizing global macro data..."):
+                        global_briefing = get_global_briefing(global_headlines)
+
+                    if global_briefing:
+                        st.markdown(f"""
+                            <div style="background-color: #000000; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 10px;">
+                                <h4 style="color: #00d2ff; margin-top: 0; font-family: monospace;">🤖 GLOBAL MACRO BRIEFING</h4>
+                                <p style="color: #FFFFFF; font-size: 15px; line-height: 1.6;">{global_briefing}</p>
+                            </div>
+                        """, unsafe_allow_html=True)
+
                     with st.container(height=400):
                         for item in g_news[:10]:
                             st.markdown(f"🔗 **[{item['headline']}]({item['url']})**")
                             st.markdown("---")
-
-                    # AI briefing loads async after headlines are visible
-                    @st.fragment
-                    def render_global_briefing(headlines):
-                        with st.spinner("🤖 AI is synthesizing global macro data..."):
-                            global_briefing = get_ai_summary(headlines)
-                        if global_briefing and not global_briefing.startswith("AI Error"):
-                            st.markdown(f"""
-                                <div style="background-color: #000000; padding: 20px; border-radius: 8px; border: 1px solid #333333; border-left: 4px solid #00d2ff; margin-bottom: 10px;">
-                                    <h4 style="color: #00d2ff; margin-top: 0; font-family: monospace;">🤖 GLOBAL MACRO BRIEFING</h4>
-                                    <p style="color: #FFFFFF; font-size: 15px; line-height: 1.6;">{global_briefing}</p>
-                                </div>
-                            """, unsafe_allow_html=True)
-
-                    global_headlines = "\n".join([f"- {item['headline']}" for item in g_news[:10]])
-                    render_global_briefing(global_headlines)
 
             except Exception as e:
                 st.error(f"News unavailable: {e}")
