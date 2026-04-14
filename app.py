@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from fredapi import Fred
 from datetime import datetime, timedelta
 import google.genai as genai
+from google.genai import types
 
 # --- 1. DATA STORAGE (SUPABASE CLOUD) ---
 from supabase import create_client, Client
@@ -192,7 +193,15 @@ def call_gemini(prompt):
         return None, None
     for model in GEMINI_MODELS:
         try:
-            response = ai_client.models.generate_content(model=model, contents=prompt)
+            # Injecting the strict config here
+            response = ai_client.models.generate_content(
+                model=model, 
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1, # Forces strict, robotic consistency
+                    max_output_tokens=300
+                )
+            )
             raw = response.text
             if raw and raw.strip():
                 return raw.strip(), model
@@ -242,7 +251,9 @@ def get_ai_news_analysis(headlines_text):
     prompt = f"""
     Act as an expert financial analyst. Read the following recent news headlines.
 
-    Your response must follow this EXACT format with these three labeled sections:
+    Your response must follow this EXACT format with these three labeled sections.
+    DO NOT output any conversational filler. DO NOT use markdown bolding on the labels. 
+    Output ONLY the labels and the text.
 
     BRIEFING: Write a cohesive 3-sentence executive summary highlighting key tailwinds and headwinds. Professional and objective tone.
 
